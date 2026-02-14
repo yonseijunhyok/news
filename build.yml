@@ -1,0 +1,27 @@
+name: Build EXE
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build exe
+        run: pyinstaller --onefile --noconsole --name Naver_No_Politics app.py
+
+      - name: Upload exe
+        uses: actions/upload-artifact@v3
+        with:
+          name: exe-file
+          path: dist/Naver_No_Politics.exe
