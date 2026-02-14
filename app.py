@@ -1,7 +1,9 @@
+import re
 import threading
 import webbrowser
 from dataclasses import dataclass
-from typing import List, Set
+from typing import List, Set, Optional
+from urllib.parse import urlparse, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
@@ -11,51 +13,51 @@ from tkinter import messagebox
 RANKING_URL = "https://news.naver.com/main/ranking/popularMemo.naver"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# exe 옆에 이 파일을 만들면, 한 줄에 하나씩 "강한 차단 단어(구체 표현)"를 추가할 수 있음
+# exe 옆에 만들 수 있는 사용자 차단 키워드 파일(한 줄 1개, 2글자 이상 권장)
 USER_BLOCKLIST_FILE = "user_block_keywords.txt"
 
-# URL에 이 섹션 코드가 있으면 정치로 확정
-POLITICS_SID = {"sid1=100", "sid=100"}
+# URL에 정치 섹션 코드가 확실히 있으면 정치로 간주
+POLITICS_SID_PATTERNS = (r"([?&])sid1=100([&#]|$)", r"([?&])sid=100([&#]|$)")
 
+# ✅ 네이버 기능/메뉴 텍스트(기사 아님) — 이런 텍스트는 목록에서 제외
+NON_ARTICLE_TITLES = {
+    "많이 본 뉴스", "댓글 많은 뉴스", "공감 많은 뉴스", "랭킹뉴스", "랭킹",
+    "정치", "경제", "사회", "생활/문화", "IT/과학", "세계", "연예", "스포츠",
+    "뉴스", "홈"
+}
 
-# ✅ 1) 정치 "확정" 단어들: 이 중 하나라도 제목에 있으면 바로 차단
-#    (정당/정치인 실명/기관/선거 등)
-DEFAULT_STRONG = {
+# ✅ 정치 “확정” 키워드(강하게)
+# - 정당/기관/선거/정치인 실명/정치권 표현
+DEFAULT_POLITICS_KEYWORDS = {
     # 정당/정치권
-    "국민의힘", "더불어민주당", "정의당", "진보당", "개혁신당",
-    "국힘", "민주당", "여당", "야당", "당대표", "원내대표", "비대위", "공천", "경선",
+    "국민의힘", "국힘", "더불어민주당", "민주당", "정의당", "진보당", "개혁신당",
+    "여당", "야당", "여야", "여권", "야권", "정치권", "당대표", "원내대표", "비대위",
+    "공천", "경선",
 
     # 선거
-    "총선", "대선", "지방선거", "보궐선거", "재보궐", "투표", "득표",
+    "선거", "총선", "대선", "지방선거", "보궐선거", "재보궐",
 
     # 기관/직책
     "국회", "국회의원", "의원", "본회의", "상임위", "법사위", "청문회",
-    "대통령실", "대통령", "총리", "장관", "국무회의", "청와대",
-    "헌법재판소", "헌재", "국정원", "감사원",
+    "대통령", "대통령실", "총리", "장관", "국무", "청와대",
+    "헌재", "헌법재판소", "대법원", "검찰", "법무부", "감사원", "국정원",
 
-    # 대표 정치인(✅ 한 글자 금지: "윤" 같은 건 절대 넣지 않음)
-    "윤석열", "이재명", "한동훈", "이준석", "조국", "홍준표", "오세훈", "문재인", "박근혜",
+    # 외교/안보(정치성이 강하게 섞이는 키워드)
+    "외교", "안보", "국방", "북한", "대북", "한미", "한일",
+
+    # 정치 관련 사건/프레임
+    "탄핵", "계엄", "내란", "특검", "정권", "정국",
+
+    # 자주 등장하는 정치인/인물(요청 예시 포함)
+    "윤석열", "한동훈", "배현진", "장동혁", "송영길", "이재명", "이준석", "조국", "홍준표",
+    # ‘李’는 특정인 지칭에 많이 쓰지만 매우 짧아서 남용 위험이 있어 기본엔 넣지 않음.
 }
 
-# ✅ 2) 정치 "맥락" 단어들: 이것만으로는 차단하지 않음 (문맥용)
-CONTEXT = {
-    "정권", "정국", "국정", "정치권", "정치권의", "여의도",
-    "대통령실", "국회", "정당", "선거", "공천", "경선",
-    "외교", "안보", "대북", "북한", "한미", "한일",
-    "검찰", "법무부", "특검", "국정감사",
-}
+# 너무 짧거나 흔해서 위험한 것들은 자동 무시(사용자 파일에도 적용)
+ALWAYS_IGNORE = {"윤", "李", "野"}  # 필요한 경우엔 "윤석열", "野당"처럼 구체로
 
-# ✅ 3) 애매한 단어들: 단독으로는 차단하지 않음 (맥락 단어랑 같이 있을 때만 차단)
-WEAK = {
-    "재판", "수사", "기소", "구속", "영장", "공판",
-    "발언", "논란", "비판", "반박", "공방", "공격",
-    "파장", "격돌", "폭로", "혐의",
-    "탄핵", "계엄", "내란",  # 이건 정치성이 강하지만, 기사 맥락상 완충을 위해 "맥락+약어"로 처리
-}
-
-# ✅ 4) 아주 흔한 단어는 사용자 파일에 있어도 무시(실수 방지)
-#    (원하면 추가 가능)
-ALWAYS_IGNORE = {"윤", "재판", "수사"}  # <- 너무 넓게 잡히는 것들
+# 제목에 이런 문자만 있는 건 제외(메뉴/버튼류)
+MIN_TITLE_LEN = 10
 
 
 @dataclass
@@ -65,8 +67,7 @@ class Article:
 
 
 def normalize(s: str) -> str:
-    # 공백/특수기호를 대충 정리해서 매칭 안정화
-    return " ".join(s.replace("\u3000", " ").split()).strip()
+    return " ".join((s or "").replace("\u3000", " ").split()).strip()
 
 
 def load_user_block_keywords() -> Set[str]:
@@ -78,10 +79,9 @@ def load_user_block_keywords() -> Set[str]:
                 if not w or w.startswith("#"):
                     continue
                 w = normalize(w)
-                # ✅ 한 글자는 무시 (윤 같은 실수 방지)
+                # 1글자/위험단어는 자동 무시
                 if len(w) <= 1:
                     continue
-                # ✅ 너무 흔한 단어는 무시
                 if w in ALWAYS_IGNORE:
                     continue
                 kws.add(w)
@@ -93,35 +93,62 @@ def load_user_block_keywords() -> Set[str]:
 
 
 def is_politics_by_url(url: str) -> bool:
-    return any(s in url for s in POLITICS_SID)
+    for pat in POLITICS_SID_PATTERNS:
+        if re.search(pat, url):
+            return True
+    return False
 
 
-def contains_any(text: str, words: Set[str]) -> bool:
-    return any(w in text for w in words)
-
-
-def is_politics_smart(title: str, strong: Set[str], context: Set[str], weak: Set[str]) -> bool:
+def is_politics_by_title(title: str, block_keywords: Set[str]) -> bool:
     t = normalize(title)
+    return any(k in t for k in block_keywords)
 
-    # 1) 확정 단어는 바로 차단
-    if contains_any(t, strong):
+
+def looks_like_article_url(url: str) -> bool:
+    """
+    기사 링크만 최대한 안정적으로 골라내기 위한 휴리스틱.
+    - oid/aid 파라미터가 있거나
+    - /article/ 경로를 포함하는 등
+    """
+    if "news.naver.com" not in url:
+        return False
+
+    # 랭킹 메인/탭/기능 페이지 제외
+    if "ranking" in url and "read" not in url and "/article/" not in url:
+        # 예: popularMemo.naver, rankingList.naver 등
+        return False
+
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+
+    # 네이버 기사 URL의 대표적 신호: oid & aid
+    if "oid" in qs and "aid" in qs:
         return True
 
-    # 2) 애매한 단어는 "정치 맥락"이 같이 있을 때만 차단
-    has_context = contains_any(t, context)
-    has_weak = contains_any(t, weak)
-    if has_context and has_weak:
+    # 신형 경로 패턴(있을 수 있음)
+    if "/article/" in parsed.path:
         return True
 
-    # 3) 아주 정치성이 강한 조합(특정 표현)
-    #    (여기서도 짧은 단어 단독은 쓰지 않음)
-    special_phrases = {
-        "내란 재판", "계엄 논란", "탄핵 정국", "특검 추진", "공천 논란",
-        "대통령실 브리핑", "국회 통과", "법안 발의", "국정감사",
-    }
-    if contains_any(t, special_phrases):
+    # read.naver.com 도 기사일 때가 있음
+    if "read.naver.com" in url:
         return True
 
+    return False
+
+
+def is_non_article_title(title: str) -> bool:
+    t = normalize(title)
+    if not t:
+        return True
+    if t in NON_ARTICLE_TITLES:
+        return True
+    # “많이 본 뉴스”, “댓글 많은 뉴스” 같은 문구가 포함된 버튼/탭 제거
+    for kw in ("많이 본", "댓글 많은", "공감 많은", "랭킹", "더보기"):
+        if kw in t and len(t) <= 20:
+            return True
+    # 너무 짧은 건 메뉴일 확률이 큼
+    if len(t) < MIN_TITLE_LEN:
+        return True
     return False
 
 
@@ -130,43 +157,42 @@ def fetch_articles() -> List[Article]:
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "lxml")
 
-    user_strong = load_user_block_keywords()
-
-    strong = set(DEFAULT_STRONG) | user_strong
-    context = set(CONTEXT)
-    weak = set(WEAK)
+    block_keywords = set(DEFAULT_POLITICS_KEYWORDS) | load_user_block_keywords()
 
     result: List[Article] = []
-    seen = set()
+    seen_urls = set()
 
     for a in soup.select("a[href]"):
-        href = (a.get("href") or "").strip()
-        title = a.get_text(" ", strip=True)
+        href = normalize(a.get("href", ""))
+        title = normalize(a.get_text(" ", strip=True))
 
         if not href or not title:
             continue
 
+        # 상대경로 -> 절대경로
         if href.startswith("/"):
             href = "https://news.naver.com" + href
 
-        if "news.naver.com" not in href:
+        # 기사 링크만 선별
+        if not looks_like_article_url(href):
             continue
 
-        if len(title) < 6:
+        # 기능/탭/메뉴 텍스트 제외
+        if is_non_article_title(title):
             continue
 
-        key = (title, href)
-        if key in seen:
+        # URL 중복 제거
+        if href in seen_urls:
             continue
-        seen.add(key)
+        seen_urls.add(href)
 
         # 정치 제외
         if is_politics_by_url(href):
             continue
-        if is_politics_smart(title, strong, context, weak):
+        if is_politics_by_title(title, block_keywords):
             continue
 
-        result.append(Article(title=normalize(title), url=href))
+        result.append(Article(title=title, url=href))
 
     return result
 
@@ -223,7 +249,7 @@ class App:
         ).pack(anchor="w")
 
         self.articles: List[Article] = []
-        self.top1: Article | None = None
+        self.top1: Optional[Article] = None
 
     def set_busy(self, busy: bool, msg: str):
         self.btn.config(state=("disabled" if busy else "normal"))
@@ -254,6 +280,7 @@ class App:
             self.top_title.config(text="(표시할 뉴스가 없어요. 필터가 너무 강할 수도 있어요.)")
             self.top_open.config(state="disabled")
 
+        # TOP1 제외한 나머지
         for i, a in enumerate(arts[1:], start=2):
             self.listbox.insert(tk.END, f"{i:02d}. {a.title}")
 
