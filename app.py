@@ -1,305 +1,326 @@
-import re
+import json
+import queue
 import threading
-import webbrowser
+import time
 from dataclasses import dataclass
-from typing import List, Set, Optional
-from urllib.parse import urlparse, parse_qs
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
-import requests
-from bs4 import BeautifulSoup
+import cv2
+import mss
+import numpy as np
+import pyautogui
+import pytesseract
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 
-RANKING_URL = "https://news.naver.com/main/ranking/popularMemo.naver"
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+pyautogui.FAILSAFE = True
 
-# exe 옆에 만들 수 있는 사용자 차단 키워드 파일(한 줄 1개, 2글자 이상 권장)
-USER_BLOCKLIST_FILE = "user_block_keywords.txt"
-
-# URL에 정치 섹션 코드가 확실히 있으면 정치로 간주
-POLITICS_SID_PATTERNS = (r"([?&])sid1=100([&#]|$)", r"([?&])sid=100([&#]|$)")
-
-# ✅ 네이버 기능/메뉴 텍스트(기사 아님) — 이런 텍스트는 목록에서 제외
-NON_ARTICLE_TITLES = {
-    "많이 본 뉴스", "댓글 많은 뉴스", "공감 많은 뉴스", "랭킹뉴스", "랭킹",
-    "정치", "경제", "사회", "생활/문화", "IT/과학", "세계", "연예", "스포츠",
-    "뉴스", "홈"
-}
-
-# ✅ 정치 “확정” 키워드(강하게)
-# - 정당/기관/선거/정치인 실명/정치권 표현
-DEFAULT_POLITICS_KEYWORDS = {
-    # 정당/정치권
-    "국민의힘", "국힘", "더불어민주당", "민주당", "정의당", "진보당", "개혁신당",
-    "여당", "야당", "여야", "여권", "야권", "정치권", "당대표", "원내대표", "비대위",
-    "공천", "경선",
-
-    # 선거
-    "선거", "총선", "대선", "지방선거", "보궐선거", "재보궐",
-
-    # 기관/직책
-    "국회", "국회의원", "의원", "본회의", "상임위", "법사위", "청문회",
-    "대통령", "대통령실", "총리", "장관", "국무", "청와대",
-    "헌재", "헌법재판소", "대법원", "검찰", "법무부", "감사원", "국정원",
-
-    # 외교/안보(정치성이 강하게 섞이는 키워드)
-    "외교", "안보", "국방", "북한", "대북", "한미", "한일",
-
-    # 정치 관련 사건/프레임
-    "탄핵", "계엄", "내란", "특검", "정권", "정국",
-
-    # 자주 등장하는 정치인/인물(요청 예시 포함)
-    "윤석열", "한동훈", "배현진", "장동혁", "송영길", "이재명", "이준석", "조국", "홍준표",
-    # ‘李’는 특정인 지칭에 많이 쓰지만 매우 짧아서 남용 위험이 있어 기본엔 넣지 않음.
-}
-
-# 너무 짧거나 흔해서 위험한 것들은 자동 무시(사용자 파일에도 적용)
-ALWAYS_IGNORE = {"윤", "李", "野"}  # 필요한 경우엔 "윤석열", "野당"처럼 구체로
-
-# 제목에 이런 문자만 있는 건 제외(메뉴/버튼류)
-MIN_TITLE_LEN = 10
+CONFIG_PATH = Path("macro_config.json")
 
 
 @dataclass
-class Article:
-    title: str
-    url: str
+class TemplateItem:
+    name: str
+    path: Path
 
 
-def normalize(s: str) -> str:
-    return " ".join((s or "").replace("\u3000", " ").split()).strip()
-
-
-def load_user_block_keywords() -> Set[str]:
-    kws: Set[str] = set()
-    try:
-        with open(USER_BLOCKLIST_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                w = line.strip()
-                if not w or w.startswith("#"):
-                    continue
-                w = normalize(w)
-                # 1글자/위험단어는 자동 무시
-                if len(w) <= 1:
-                    continue
-                if w in ALWAYS_IGNORE:
-                    continue
-                kws.add(w)
-    except FileNotFoundError:
-        pass
-    except Exception:
-        pass
-    return kws
-
-
-def is_politics_by_url(url: str) -> bool:
-    for pat in POLITICS_SID_PATTERNS:
-        if re.search(pat, url):
-            return True
-    return False
-
-
-def is_politics_by_title(title: str, block_keywords: Set[str]) -> bool:
-    t = normalize(title)
-    return any(k in t for k in block_keywords)
-
-
-def looks_like_article_url(url: str) -> bool:
-    """
-    기사 링크만 최대한 안정적으로 골라내기 위한 휴리스틱.
-    - oid/aid 파라미터가 있거나
-    - /article/ 경로를 포함하는 등
-    """
-    if "news.naver.com" not in url:
-        return False
-
-    # 랭킹 메인/탭/기능 페이지 제외
-    if "ranking" in url and "read" not in url and "/article/" not in url:
-        # 예: popularMemo.naver, rankingList.naver 등
-        return False
-
-    parsed = urlparse(url)
-    qs = parse_qs(parsed.query)
-
-    # 네이버 기사 URL의 대표적 신호: oid & aid
-    if "oid" in qs and "aid" in qs:
-        return True
-
-    # 신형 경로 패턴(있을 수 있음)
-    if "/article/" in parsed.path:
-        return True
-
-    # read.naver.com 도 기사일 때가 있음
-    if "read.naver.com" in url:
-        return True
-
-    return False
-
-
-def is_non_article_title(title: str) -> bool:
-    t = normalize(title)
-    if not t:
-        return True
-    if t in NON_ARTICLE_TITLES:
-        return True
-    # “많이 본 뉴스”, “댓글 많은 뉴스” 같은 문구가 포함된 버튼/탭 제거
-    for kw in ("많이 본", "댓글 많은", "공감 많은", "랭킹", "더보기"):
-        if kw in t and len(t) <= 20:
-            return True
-    # 너무 짧은 건 메뉴일 확률이 큼
-    if len(t) < MIN_TITLE_LEN:
-        return True
-    return False
-
-
-def fetch_articles() -> List[Article]:
-    r = requests.get(RANKING_URL, headers=HEADERS, timeout=10)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "lxml")
-
-    block_keywords = set(DEFAULT_POLITICS_KEYWORDS) | load_user_block_keywords()
-
-    result: List[Article] = []
-    seen_urls = set()
-
-    for a in soup.select("a[href]"):
-        href = normalize(a.get("href", ""))
-        title = normalize(a.get_text(" ", strip=True))
-
-        if not href or not title:
-            continue
-
-        # 상대경로 -> 절대경로
-        if href.startswith("/"):
-            href = "https://news.naver.com" + href
-
-        # 기사 링크만 선별
-        if not looks_like_article_url(href):
-            continue
-
-        # 기능/탭/메뉴 텍스트 제외
-        if is_non_article_title(title):
-            continue
-
-        # URL 중복 제거
-        if href in seen_urls:
-            continue
-        seen_urls.add(href)
-
-        # 정치 제외
-        if is_politics_by_url(href):
-            continue
-        if is_politics_by_title(title, block_keywords):
-            continue
-
-        result.append(Article(title=title, url=href))
-
-    return result
-
-
-class App:
+class MacroApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        root.title("네이버 랭킹 - 정치 제외")
-        root.geometry("900x650")
+        self.root.title("로그라이크 선택지 매크로 (Windows)")
+        self.root.geometry("930x680")
 
-        top = tk.Frame(root)
+        self.templates: List[TemplateItem] = []
+        self.template_cache: Dict[str, np.ndarray] = {}
+        self.running = False
+        self.mode = "image"
+        self.worker_thread: Optional[threading.Thread] = None
+        self.ui_queue: "queue.Queue[str]" = queue.Queue()
+
+        self._build_ui()
+        self.load_config()
+        self.root.after(120, self.process_ui_queue)
+
+    def _build_ui(self) -> None:
+        top = tk.Frame(self.root)
         top.pack(fill="x", padx=12, pady=10)
 
-        self.status = tk.Label(top, text="새로고침을 누르세요.")
-        self.status.pack(side="left")
+        tk.Label(top, text="Tesseract 경로:").pack(side="left")
+        self.tesseract_path_var = tk.StringVar(value=r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+        tk.Entry(top, textvariable=self.tesseract_path_var, width=55).pack(side="left", padx=8)
+        tk.Button(top, text="찾기", command=self.pick_tesseract).pack(side="left")
 
-        self.btn = tk.Button(top, text="새로고침", command=self.refresh)
-        self.btn.pack(side="right")
+        templates_frame = tk.LabelFrame(self.root, text="1) 사전 등록 이미지 (선택지 캡처)")
+        templates_frame.pack(fill="both", padx=12, pady=8, expand=True)
 
-        hot = tk.LabelFrame(root, text="지금 제일 핫한 뉴스 (TOP 1)")
-        hot.pack(fill="x", padx=12, pady=(0, 10))
+        self.template_list = tk.Listbox(templates_frame, height=11)
+        self.template_list.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=10)
 
-        self.top_title = tk.Label(
-            hot,
-            text="(아직 없음)",
-            font=("맑은 고딕", 14, "bold"),
-            justify="left",
-            anchor="w",
-            wraplength=850,
+        btns = tk.Frame(templates_frame)
+        btns.pack(side="left", fill="y", padx=10, pady=10)
+        tk.Button(btns, text="이미지 추가", width=14, command=self.add_template).pack(pady=4)
+        tk.Button(btns, text="선택 제거", width=14, command=self.remove_template).pack(pady=4)
+        tk.Button(btns, text="설정 저장", width=14, command=self.save_config).pack(pady=4)
+
+        options = tk.LabelFrame(self.root, text="2) 동작 조건")
+        options.pack(fill="x", padx=12, pady=8)
+
+        row1 = tk.Frame(options)
+        row1.pack(fill="x", padx=10, pady=6)
+        tk.Label(row1, text="이미지 모드 목표 이름:").pack(side="left")
+        self.target_name_var = tk.StringVar()
+        tk.Entry(row1, textvariable=self.target_name_var, width=22).pack(side="left", padx=8)
+        tk.Label(row1, text="(비우면 최고 매칭 이미지 클릭)").pack(side="left")
+
+        row2 = tk.Frame(options)
+        row2.pack(fill="x", padx=10, pady=6)
+        tk.Label(row2, text="텍스트 모드 키워드(콤마 구분):").pack(side="left")
+        self.text_keywords_var = tk.StringVar(value="전투,회복,보상")
+        tk.Entry(row2, textvariable=self.text_keywords_var, width=45).pack(side="left", padx=8)
+
+        row3 = tk.Frame(options)
+        row3.pack(fill="x", padx=10, pady=6)
+        tk.Label(row3, text="탐지 주기(초):").pack(side="left")
+        self.interval_var = tk.StringVar(value="0.8")
+        tk.Entry(row3, textvariable=self.interval_var, width=10).pack(side="left", padx=8)
+        tk.Label(row3, text="이미지 임계값(0~1):").pack(side="left")
+        self.threshold_var = tk.StringVar(value="0.86")
+        tk.Entry(row3, textvariable=self.threshold_var, width=10).pack(side="left", padx=8)
+
+        controls = tk.Frame(self.root)
+        controls.pack(fill="x", padx=12, pady=8)
+
+        tk.Button(controls, text="이미지 모드 시작", command=self.start_image_mode).pack(side="left", padx=4)
+        tk.Button(controls, text="텍스트 모드 시작", command=self.start_text_mode).pack(side="left", padx=4)
+        tk.Button(controls, text="중지", command=self.stop).pack(side="left", padx=4)
+
+        self.status_var = tk.StringVar(value="준비됨")
+        tk.Label(self.root, textvariable=self.status_var, anchor="w", fg="#444").pack(fill="x", padx=14, pady=(0, 10))
+
+        tips = (
+            "팁: 앱플레이어를 화면에 띄운 뒤 실행하세요. 클릭은 실제 윈도우 커서로 진행됩니다.\n"
+            "긴급 중지는 마우스를 좌상단(0,0)으로 이동하면 FAILSAFE로 정지됩니다."
         )
-        self.top_title.pack(fill="x", padx=10, pady=(10, 6))
+        tk.Label(self.root, text=tips, justify="left", fg="#666").pack(fill="x", padx=14, pady=(0, 12))
 
-        self.top_open = tk.Button(hot, text="TOP 1 열기", state="disabled", command=self.open_top1)
-        self.top_open.pack(anchor="w", padx=10, pady=(0, 10))
+    def pick_tesseract(self) -> None:
+        file_path = filedialog.askopenfilename(filetypes=[("tesseract", "tesseract.exe"), ("실행 파일", "*.exe")])
+        if file_path:
+            self.tesseract_path_var.set(file_path)
 
-        mid = tk.LabelFrame(root, text="나머지 뉴스")
-        mid.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+    def add_template(self) -> None:
+        file_paths = filedialog.askopenfilenames(
+            title="선택지 이미지 선택",
+            filetypes=[("Image", "*.png;*.jpg;*.jpeg;*.bmp")],
+        )
+        for fp in file_paths:
+            path = Path(fp)
+            if not path.exists():
+                continue
+            if any(t.path == path for t in self.templates):
+                continue
+            self.templates.append(TemplateItem(name=path.stem, path=path))
+            self.template_list.insert(tk.END, f"{path.stem} | {path}")
+            self.template_cache.pop(str(path), None)
 
-        self.listbox = tk.Listbox(mid, font=("맑은 고딕", 11))
-        self.listbox.pack(side="left", fill="both", expand=True)
-
-        scrollbar = tk.Scrollbar(mid, command=self.listbox.yview)
-        scrollbar.pack(side="right", fill="y")
-        self.listbox.config(yscrollcommand=scrollbar.set)
-
-        self.listbox.bind("<Double-Button-1>", self.open_selected)
-
-        bottom = tk.Frame(root)
-        bottom.pack(fill="x", padx=12, pady=(0, 12))
-        tk.Label(
-            bottom,
-            text="필터 추가: exe 옆에 user_block_keywords.txt 파일을 만들고, 한 줄에 하나씩(2글자 이상) 추가하면 적용됩니다.",
-            fg="#555555",
-        ).pack(anchor="w")
-
-        self.articles: List[Article] = []
-        self.top1: Optional[Article] = None
-
-    def set_busy(self, busy: bool, msg: str):
-        self.btn.config(state=("disabled" if busy else "normal"))
-        self.status.config(text=msg)
-
-    def refresh(self):
-        def worker():
-            try:
-                self.root.after(0, lambda: self.set_busy(True, "불러오는 중..."))
-                arts = fetch_articles()
-                self.root.after(0, lambda: self.update_ui(arts))
-            except Exception as e:
-                self.root.after(0, lambda: self.set_busy(False, "실패"))
-                self.root.after(0, lambda: messagebox.showerror("오류", f"불러오지 못했습니다.\n\n{e}"))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def update_ui(self, arts: List[Article]):
-        self.articles = arts
-        self.listbox.delete(0, tk.END)
-
-        if arts:
-            self.top1 = arts[0]
-            self.top_title.config(text=self.top1.title)
-            self.top_open.config(state="normal")
-        else:
-            self.top1 = None
-            self.top_title.config(text="(표시할 뉴스가 없어요. 필터가 너무 강할 수도 있어요.)")
-            self.top_open.config(state="disabled")
-
-        # TOP1 제외한 나머지
-        for i, a in enumerate(arts[1:], start=2):
-            self.listbox.insert(tk.END, f"{i:02d}. {a.title}")
-
-        self.set_busy(False, f"완료: {len(arts)}개 (정치 제외)")
-
-    def open_top1(self):
-        if self.top1:
-            webbrowser.open(self.top1.url)
-
-    def open_selected(self, _event=None):
-        sel = self.listbox.curselection()
-        if not sel:
+    def remove_template(self) -> None:
+        indices = list(self.template_list.curselection())
+        if not indices:
             return
-        real_idx = sel[0] + 1
-        if 0 <= real_idx < len(self.articles):
-            webbrowser.open(self.articles[real_idx].url)
+        for idx in reversed(indices):
+            key = str(self.templates[idx].path)
+            del self.templates[idx]
+            self.template_list.delete(idx)
+            self.template_cache.pop(key, None)
+
+    def start_image_mode(self) -> None:
+        if not self.templates:
+            messagebox.showwarning("안내", "먼저 선택지 이미지를 1개 이상 등록하세요.")
+            return
+        self.mode = "image"
+        self.start_worker()
+
+    def start_text_mode(self) -> None:
+        self.mode = "text"
+        tesseract_path = Path(self.tesseract_path_var.get())
+        if not tesseract_path.exists():
+            messagebox.showwarning("안내", "Tesseract 경로가 올바르지 않습니다.")
+            return
+        pytesseract.pytesseract.tesseract_cmd = str(tesseract_path)
+        self.start_worker()
+
+    def start_worker(self) -> None:
+        if self.running:
+            return
+
+        try:
+            interval = max(0.2, float(self.interval_var.get() or "0.8"))
+            threshold = float(self.threshold_var.get() or "0.86")
+            if threshold < 0 or threshold > 1:
+                raise ValueError("임계값은 0~1 사이여야 합니다.")
+            self.interval_var.set(str(interval))
+        except ValueError as exc:
+            messagebox.showwarning("입력 오류", str(exc))
+            return
+
+        self.running = True
+        self.set_status(f"실행 중 ({self.mode} 모드)")
+        self.worker_thread = threading.Thread(target=self.run_loop, daemon=True)
+        self.worker_thread.start()
+
+    def stop(self) -> None:
+        self.running = False
+        self.set_status("중지됨")
+
+    def set_status(self, message: str) -> None:
+        self.status_var.set(message)
+
+    def process_ui_queue(self) -> None:
+        while True:
+            try:
+                msg = self.ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.set_status(msg)
+        self.root.after(120, self.process_ui_queue)
+
+    def run_loop(self) -> None:
+        with mss.mss() as sct:
+            while self.running:
+                try:
+                    hit = self.find_by_image(sct) if self.mode == "image" else self.find_by_text(sct)
+                    if hit:
+                        x, y, reason = hit
+                        self.ui_queue.put(f"클릭: ({x}, {y}) | {reason}")
+                        pyautogui.click(x=x, y=y)
+                        time.sleep(0.45)
+                except pyautogui.FailSafeException:
+                    self.running = False
+                    self.ui_queue.put("FAILSAFE 작동: 마우스가 좌상단으로 이동되어 자동 중지됨")
+                    break
+                except Exception as exc:
+                    self.ui_queue.put(f"오류: {exc}")
+
+                interval = max(0.2, float(self.interval_var.get() or "0.8"))
+                time.sleep(interval)
+
+    def _grab_screen(self, sct: mss.mss) -> np.ndarray:
+        monitor = sct.monitors[1]
+        shot = sct.grab(monitor)
+        img = np.array(shot)
+        return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+    def _load_template(self, path: Path) -> Optional[np.ndarray]:
+        cache_key = str(path)
+        if cache_key in self.template_cache:
+            return self.template_cache[cache_key]
+        tpl = cv2.imread(cache_key, cv2.IMREAD_GRAYSCALE)
+        if tpl is None:
+            return None
+        self.template_cache[cache_key] = tpl
+        return tpl
+
+    def find_by_image(self, sct: mss.mss) -> Optional[Tuple[int, int, str]]:
+        screen = self._grab_screen(sct)
+        screen_gray = cv2.cvtColor(screen, cv2.COLOR_BGR2GRAY)
+        threshold = float(self.threshold_var.get() or "0.86")
+
+        target = self.target_name_var.get().strip().lower()
+        candidates = self.templates
+        if target:
+            candidates = [t for t in self.templates if t.name.lower() == target]
+            if not candidates:
+                return None
+
+        best_score = 0.0
+        best_click: Optional[Tuple[int, int, str]] = None
+
+        for item in candidates:
+            tpl = self._load_template(item.path)
+            if tpl is None:
+                continue
+
+            th, tw = tpl.shape
+            sh, sw = screen_gray.shape
+            if th > sh or tw > sw:
+                continue
+
+            res = cv2.matchTemplate(screen_gray, tpl, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(res)
+
+            if max_val > best_score:
+                cx = max_loc[0] + tw // 2
+                cy = max_loc[1] + th // 2
+                best_score = max_val
+                best_click = (cx, cy, f"이미지: {item.name} ({max_val:.2f})")
+
+        if best_click and best_score >= threshold:
+            return best_click
+        return None
+
+    def find_by_text(self, sct: mss.mss) -> Optional[Tuple[int, int, str]]:
+        screen = self._grab_screen(sct)
+        gray = cv2.cvtColor(screen, cv2.COLOR_BGR2GRAY)
+        _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        data = pytesseract.image_to_data(
+            th,
+            lang="kor+eng",
+            config="--oem 3 --psm 6",
+            output_type=pytesseract.Output.DICT,
+        )
+        keywords = [k.strip() for k in self.text_keywords_var.get().split(",") if k.strip()]
+
+        if not keywords:
+            return None
+
+        for i, word in enumerate(data.get("text", [])):
+            txt = (word or "").strip()
+            if not txt:
+                continue
+            if any(k.lower() in txt.lower() for k in keywords):
+                x = data["left"][i] + data["width"][i] // 2
+                y = data["top"][i] + data["height"][i] // 2
+                return x, y, f"텍스트: {txt}"
+        return None
+
+    def save_config(self) -> None:
+        payload = {
+            "tesseract_path": self.tesseract_path_var.get(),
+            "target_name": self.target_name_var.get(),
+            "text_keywords": self.text_keywords_var.get(),
+            "interval": self.interval_var.get(),
+            "threshold": self.threshold_var.get(),
+            "templates": [str(t.path) for t in self.templates],
+        }
+        CONFIG_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.set_status("설정을 저장했습니다.")
+
+    def load_config(self) -> None:
+        if not CONFIG_PATH.exists():
+            return
+        try:
+            payload = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return
+
+        self.tesseract_path_var.set(payload.get("tesseract_path", self.tesseract_path_var.get()))
+        self.target_name_var.set(payload.get("target_name", ""))
+        self.text_keywords_var.set(payload.get("text_keywords", self.text_keywords_var.get()))
+        self.interval_var.set(str(payload.get("interval", self.interval_var.get())))
+        self.threshold_var.set(str(payload.get("threshold", self.threshold_var.get())))
+
+        template_paths = payload.get("templates", [])
+        for fp in template_paths:
+            path = Path(fp)
+            if path.exists() and not any(t.path == path for t in self.templates):
+                self.templates.append(TemplateItem(name=path.stem, path=path))
+                self.template_list.insert(tk.END, f"{path.stem} | {path}")
 
 
 if __name__ == "__main__":
     root = tk.Tk()
-    App(root)
+    app = MacroApp(root)
+    root.protocol("WM_DELETE_WINDOW", lambda: (app.stop(), root.destroy()))
     root.mainloop()
